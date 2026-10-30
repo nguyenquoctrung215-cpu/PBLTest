@@ -1,0 +1,708 @@
+"""
+test_mang_mo_rong.py — Hợp đồng "chạy lại cấu hình cũ phải ra đúng mạng 73 nút".
+
+Khi bật --mo-rong, nút mới PHẢI nối vào CUỐI node_order. Nếu chỉ nối vào cuối
+từng khối (space/air/ground) thì khối air phình 10 -> 14 bậc, đẩy toàn bộ khối
+ground lệch 4 chỉ số => model huấn luyện trên mạng 73 nút không còn dùng được.
+
+Chạy: python test/test_mang_mo_rong.py
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from src.physics.air_ground import make_placed_uavs, make_uav_patrols, nodes_at, static_nodes  # noqa: E402
+from src.physics.sites import (  # noqa: E402
+    CAC_TEN_CU,
+    DEFAULT_GATEWAYS,
+    DEFAULT_HAPS,
+    DEFAULT_USERS,
+    DEFAULT_UAV_CENTERS,
+    EXTRA_GROUND_SITES,
+    EXTRA_UAV_SITES,
+    khoa_sap_xep,
+)
+from test.tien_ich_test import BoQua, chay_tests, dung_utf8  # noqa: E402
+
+dung_utf8()
+
+V2 = ROOT / "dataset" / "oracle_dataset_v2.npz"
+V3 = ROOT / "dataset" / "oracle_dataset_v3.npz"
+# v3 sinh bằng `--mo-rong --sats 100`. Số vệ tinh KHÔNG suy ra được từ sites.py
+# (nó là mẫu ngẫu nhiên `rng_sat.sample` trên tệp TLE), nên phải viết cứng ở đây.
+SO_VE_TINH_V2, SO_VE_TINH_V3 = 50, 100
+SO_NUT_V2 = SO_VE_TINH_V2 + len(DEFAULT_HAPS) + len(DEFAULT_UAV_CENTERS) \
+    + len(DEFAULT_GATEWAYS) + len(DEFAULT_USERS)          # = 73
+SO_NUT_V3 = SO_VE_TINH_V3 + (SO_NUT_V2 - SO_VE_TINH_V2) \
+    + len(EXTRA_GROUND_SITES) + 2 + len(EXTRA_UAV_SITES)  # = 174
+
+
+def _mang(mo_rong):
+    """(air_names, ground_names) đúng như oracle_labeler_sagsin dựng."""
+    st = static_nodes(mo_rong=mo_rong)
+    pt = make_uav_patrols(seed=42) + (make_placed_uavs() if mo_rong else [])
+    n0 = nodes_at(0.0, st, pt)
+    air = sorted((n.name for n in n0 if n.layer == "air"), key=khoa_sap_xep)
+    gnd = sorted((n.name for n in n0 if n.layer == "ground"), key=khoa_sap_xep)
+    return air, gnd
+
+
+def test_cau_hinh_cu_van_ra_73_nut():
+    """Không bật mở rộng => đúng 73 nút, phân bố 50/5/5/13."""
+    air, gnd = _mang(False)
+    assert len(air) == len(DEFAULT_HAPS) + len(DEFAULT_UAV_CENTERS) == 10
+    assert len(gnd) == len(DEFAULT_GATEWAYS) + len(DEFAULT_USERS) == 13
+    assert 50 + len(air) + len(gnd) == 73
+
+
+def test_mo_rong_them_nut_va_giu_nguyen_khoi_cu():
+    """Bật mở rộng: thêm nút, và 73 nút cũ giữ nguyên thứ tự tuyệt đối."""
+    a0, g0 = _mang(False)
+    a1, g1 = _mang(True)
+    assert len(g1) - len(g0) == len(EXTRA_GROUND_SITES)
+    assert len(a1) - len(a0) == 2 + len(EXTRA_UAV_SITES)   # 2 HAPS + UAV đặt cố định
+    old_air = [n for n in a1 if n in set(a0)]
+    old_gnd = [n for n in g1 if n in set(g0)]
+    assert old_air == a0 and old_gnd == g0, "thứ tự nút cũ bị xáo trộn"
+    assert (a1[:len(a0)], g1[:len(g0)]) == (a0, g0), "nút mới phải nối vào CUỐI khối"
+
+
+def test_moi_nut_moi_deu_duoc_khai_bao_ngoai_CAC_TEN_CU():
+    """Nút mới phải được khai báo, không lọt vào nhóm 'nút cũ'."""
+    air, gnd = _mang(True)
+    for n in air + gnd:
+        assert (n in CAC_TEN_CU) == (khoa_sap_xep(n)[0] == 0), n
+    moi = [n for n in air + gnd if khoa_sap_xep(n)[0] == 1]
+    assert len(moi) == len(EXTRA_GROUND_SITES) + 2 + len(EXTRA_UAV_SITES)
+
+
+def test_v3_giu_nguyen_chi_so_cua_73_nut_trong_v2():
+    """Tệp v3 thật: 73 nút cũ phải còn ĐỦ mặt với đúng phân tầng như v2.
+
+    KHÔNG đòi v3.node_order[:73] == v2.node_order khi v3 dùng nhiều vệ tinh hơn:
+    `sat_names = sorted({...})` sort TOÀN CỤC 100 tên vệ tinh, nên tên của 50 vệ
+    tinh cũ chen giữa các tên mới và chỉ số tuyệt đối đổi. Đó là hệ quả tất yếu
+    của việc đổi `--sats`, không phải nút bị xáo trộn: quan hệ *tương đối* trong
+    từng tầng vẫn giữ nguyên, và W giữa các nút cũ vẫn trùng từng bit (test dưới).
+    Bất biến thật cần khoá là **tập tên** + **không nút nào biến mất**.
+    """
+    if not (V2.exists() and V3.exists()):
+        raise BoQua("chưa có oracle_dataset_v2/v3.npz")
+    a = np.load(V2, allow_pickle=True)
+    b = np.load(V3, allow_pickle=True)
+    o2 = [str(x) for x in a["node_order"]]
+    o3 = [str(x) for x in b["node_order"]]
+    assert len(o2) == SO_NUT_V2
+    # 73 nút cũ + ground mở rộng + 2 HAPS + UAV đặt cố định + (100 - 50) vệ tinh
+    assert len(o3) == SO_NUT_V3, \
+        f"v3 phải có {SO_NUT_V3} nút ({SO_VE_TINH_V3} vệ tinh + air + ground), đang {len(o3)}"
+    thieu = [n for n in o2 if n not in set(o3)]
+    assert not thieu, f"v3 làm mất {len(thieu)} nút của v2: {thieu[:5]}"
+    # Tầng ground/air của v2 phải giữ NGUYÊN thứ tự tương đối: `khoa_sap_xep` xếp
+    # nút cũ trước nút mới, nên không được có nút mới chen vào giữa.
+    for tang in ("ground", "air"):
+        cu = [n for n in o2 if (n in CAC_TEN_CU) and not n.startswith("STARLINK")
+              and (tang == "ground") != n.startswith(("HAPS", "UAV"))]
+        trong_v3 = [n for n in o3 if n in set(cu)]
+        assert trong_v3 == cu, f"thứ tự tương đối của tầng {tang} bị đổi"
+
+
+def test_v3_giu_nguyen_W_cua_cac_nut_cu():
+    """W giữa các nút cũ KHÔNG PHẢI VỆ TINH phải giống hệt v2; cặp có vệ tinh thì đổi.
+
+    Bất biến đúng (đã đo, đừng nới rộng thành "mọi ô đều trùng"):
+      * cặp ground↔ground, ground↔UAV, ground↔HAPS, UAV↔HAPS, HAPS↔HAPS: **trùng
+        tuyệt đối** — các luật này chỉ phụ thuộc toạ độ/độ cao, không phụ thuộc TLE;
+      * cặp có vệ tinh (GSL + ISL): **đổi**, vì `sample_sats` lấy mẫu độc lập nên
+        mẫu 100 vệ tinh ≠ mẫu 50. Đây là điều kiện của mạng, không phải lỗi.
+        Hệ quả định lượng nằm ở SCHEMA.md §6b: 61.9% (v2) → 31.3% (v3) số giờ-trạm
+        KHÔNG thấy vệ tinh nào, tức nhãn "dứt" bớt oan.
+    """
+    if not (V2.exists() and V3.exists()):
+        raise BoQua("chưa có oracle_dataset_v2/v3.npz")
+    a = np.load(V2, allow_pickle=True)
+    b = np.load(V3, allow_pickle=True)
+    o2 = [str(x) for x in a["node_order"]]
+    o3 = [str(x) for x in b["node_order"]]
+    idx = np.array([o3.index(n) for n in o2])
+    A = a["W_snapshots"]
+    B = b["W_snapshots"][:, idx][:, :, idx]
+    sat = np.array([n.startswith("STARLINK") for n in o2])
+    kt = ~sat                            # chỉ số nút KHÔNG phải vệ tinh
+    # BẪY numpy: `A[..., mask2d]` với mask (73,73) KHÔNG chọn cặp (u,v) — nó làm
+    # phẳng trục cuối và trả (600, 2829), tức đã "trải" cả cặp có vệ tinh vào.
+    # Phải dùng np.ix_ để lấy đúng khối con [600, |kt|, |kt|].
+    A_kt = A[:, kt][:, :, kt]
+    B_kt = B[:, kt][:, :, kt]
+    assert A_kt.shape == B_kt.shape
+    assert np.array_equal(A_kt, B_kt), (
+        f"{int((~np.isclose(A_kt, B_kt)).sum())} ô lệch ở cặp KHÔNG có vệ tinh "
+        f"(ground/UAV/HAPS) — luật không phụ thuộc TLE nên phải trùng tuyệt đối")
+    # Cặp có vệ tinh thì NGƯỢC LẠI phải khác: nếu trùng hết thì --sats 100 vô tác dụng.
+    tinh = ~kt
+    A_sat = A[:, tinh][:, :, tinh]
+    B_sat = B[:, tinh][:, :, tinh]
+    assert not np.array_equal(A_sat, B_sat), \
+        "W của mọi cặp có vệ tinh giống hệt v2 — --sats 100 không có tác dụng gì"
+    print(f"    {A_kt.size} ô không-vệ-tinh trùng tuyệt đối; "
+          f"{int((A_sat != B_sat).sum())} / {A_sat.size} ô cặp có-vệ-tinh đổi")
+
+
+def test_v3_co_toa_do_va_thong_tin_lien_ket():
+    """v3 phải lưu tọa độ từng nút và thông tin liên kết (yêu cầu đề bài)."""
+    if not V3.exists():
+        raise BoQua("chưa có oracle_dataset_v3.npz")
+    b = np.load(V3, allow_pickle=True)
+    for k in ("node_latlon_alt", "link_stats", "link_stat_cols", "mo_rong"):
+        assert k in b.files, f"thiếu khóa {k}"
+    assert bool(b["mo_rong"][0])
+    lat = b["node_latlon_alt"]
+    n_node = len(b["node_order"])
+    assert lat.shape == (600, n_node, 3)
+    # 73 nút cũ + ground mở rộng + 2 HAPS + UAV đặt cố định + (100 - 50) vệ tinh
+    kyen_vong = SO_NUT_V3
+    assert n_node == kyen_vong, \
+        f"v3 phải có {kyen_vong} nút (73 cũ + ground + HAPS + UAV + {SO_VE_TINH_V3 - SO_VE_TINH_V2} vệ tinh), " \
+        f"đang {n_node}"
+    assert np.isfinite(lat[:, :, :2]).all(), "tọa độ lat/lon không được NaN"
+    cot = [str(x) for x in b["link_stat_cols"]]
+    assert cot == ["snapshot_id", "u", "v", "distance_km", "elevation_deg",
+                   "bandwidth_mbps", "packet_loss", "exists"]
+    assert b["link_stats"].shape[1] == 8 and len(b["link_stats"]) > 0
+
+
+def test_v3_co_hoang_sa_truong_sa_va_uav_dat_co_dinh():
+    """Hai quần đảo phải có mặt, kèm UAV đặt cố định phủ chúng."""
+    if not V3.exists():
+        raise BoQua("chưa có oracle_dataset_v3.npz")
+    b = np.load(V3, allow_pickle=True)
+    o = [str(x) for x in b["node_order"]]
+    for n in ("HoangSa", "TruongSa", "UAV-HoangSa", "UAV-TruongSa"):
+        assert n in o, f"thiếu nút {n}"
+
+
+def test_v3_split_khong_ro_ri_link_stats():
+    """link_stats của từng tập phải lọc theo snapshot của tập và đánh lại cột 0.
+
+    Trước đây bảng bị chép nguyên cả bảng gốc vào cả 3 tập, nên tra bằng chỉ số
+    cục bộ sẽ lấy sai snapshot (và lộ thông tin liên kết của tập khác).
+
+    Ngưỡng "nhỏ hơn bảng gốc" đọc TRỰC TIẾP từ `oracle_dataset_v3.npz` thay vì
+    viết cứng: bản trước viết cứng `253856`, trong khi bảng gốc thật có
+    **1 018 890 dòng** — ngưỡng cũ ở dưới cả số dòng của một tập nên test đỏ
+    vĩnh viễn dù dữ liệu đúng.
+    """
+    import json
+    d = ROOT / "dataset" / "v3"
+    if not (d / "split_info.json").exists():
+        raise BoQua("chưa có dataset/v3/split_info.json")
+    goc = ROOT / "dataset" / "oracle_dataset_v3.npz"
+    if not goc.exists():
+        raise BoQua("chưa có dataset/oracle_dataset_v3.npz để so số dòng gốc")
+    n_goc = len(np.load(goc, allow_pickle=True)["link_stats"])
+    info = json.loads((d / "split_info.json").read_text(encoding="utf-8"))
+    tong = 0
+    for ten, snap_ids in info["snapshot_ids"].items():
+        f = np.load(d / f"{ten}.npz", allow_pickle=True)
+        ls, W = f["link_stats"], f["W_snapshots"]
+        tong += len(ls)
+        assert len(ls) < n_goc, \
+            f"{ten}: link_stats vẫn là cả bảng gốc ({len(ls)} / {n_goc} dòng)"
+        # cột 0 phải là chỉ số cục bộ của tập này
+        assert ls[:, 0].min() >= 0 and ls[:, 0].max() < W.shape[0], \
+            f"{ten}: snapshot_id trong link_stats vượt {W.shape[0]} snapshot của tập"
+        # số dòng phải bằng số liên kết dương của W_snapshots (bỏ đường chéo).
+        # `W = -1` là KHÔNG có liên kết, `W = 0` mới là liên kết trễ 0 — nên dùng
+        # `>= 0`, không phải `> 0`. Đã đối chiếu: 534 858 khớp từng dòng.
+        so_canh = int((W >= 0).sum()) - W.shape[0] * W.shape[1]
+        assert len(ls) == so_canh, f"{ten}: {len(ls)} dòng link_stats != {so_canh} cạnh trong W"
+        # mỗi snapshot đều có mặt đúng số liên kết của nó
+        dem = np.bincount(ls[:, 0].astype(np.int64), minlength=W.shape[0])
+        assert (dem > 0).all(), f"{ten}: có snapshot không có dòng link_stats nào"
+        assert abs(int(dem.sum()) - len(ls)) == 0
+    # ba tập không được chồng lấn: tổng phải nhỏ hơn bảng gốc đúng phần bị bỏ
+    assert tong < n_goc, f"tổng 3 tập {tong} không nhỏ hơn bảng gốc {n_goc}"
+
+
+def test_v4_split_ton_tai_va_khong_giao_snapshot():
+    """Bộ chia v4 phải nằm ở `dataset/v4/`, không đè bộ v2 ở `dataset/`.
+
+    Vì sao cần: `split_dataset.py` ghi tên cố định `train/val/test.npz`. Bỏ
+    `--outdir dataset/v4` thì nó ghi thẳng vào `dataset/`, xoá bộ v2 mà không
+    báo lỗi — và mọi con số của v2 trong báo cáo thành không tái lập được.
+
+    Khoá: 3 tập đều có, `split_info.json` trỏ đúng `oracle_dataset_v4.npz`,
+    N = 330 (không phải 174 của v2/v3), và giao snapshot giữa 3 tập = 0.
+    """
+    import itertools
+    import json
+
+    d = ROOT / "dataset" / "v4"
+    if not (d / "split_info.json").exists():
+        raise BoQua("chưa có dataset/v4/split_info.json")
+    info = json.loads((d / "split_info.json").read_text(encoding="utf-8"))
+
+    assert "oracle_dataset_v4.npz" in info["input"].replace("\\", "/"), \
+        f"bộ chia v4 lại sinh từ tệp khác: {info['input']}"
+
+    snap = info["snapshot_ids"]
+    for a, b in itertools.combinations(snap, 2):
+        chung = set(snap[a]) & set(snap[b])
+        assert not chung, f"{a} và {b} dùng chung {len(chung)} snapshot: {sorted(chung)[:5]}"
+
+    for ten in ("train", "val", "test"):
+        f = np.load(d / f"{ten}.npz", allow_pickle=True)
+        N = len(f["node_order"])
+        assert N == 330, f"{ten}.npz có {N} nút — v4 phải là 330 (v2/v3 là 174)"
+        W = f["W_snapshots"]
+        assert W.shape[1:] == (N, N), f"{ten}: W {W.shape} không khớp {N} nút"
+        assert int(f["snapshot_id"].max()) < W.shape[0], \
+            f"{ten}: snapshot_id của mẫu vượt {W.shape[0]} snapshot của tập"
+    # bộ v2 ở dataset/ KHÔNG được bị động vào
+    v2 = ROOT / "dataset" / "train.npz"
+    if v2.exists():
+        assert len(np.load(v2, allow_pickle=True)["node_order"]) != 330, \
+            "dataset/train.npz đã bị ghi đè bằng v4 — bộ v2 ở gốc dataset/ bị mất"
+
+
+
+def test_tle_vn150_la_starlink_that_va_phu_viet_nam():
+    """`data/tle/starlink_vn150.txt` phải là tập con THẬT của Starlink, và phải
+    thật sự phủ Việt Nam — không chỉ "được đặt tên là phủ Việt Nam".
+
+    Bẫy đã đo: chọn 150 vệ tinh đang có góc nâng cao nhất ở mốc t0 cho ra tập
+    **tệ hơn cả random** (chỉ 11.2 % snapshot còn vệ tinh, vì cả cụm cùng rời
+    Việt Nam một lúc). Test này khoá kết quả *đo được*, không khoá cách làm:
+    nếu ai đó thay bằng chiến lược khác mà độ phủ tụt thì test đỏ ngay.
+    """
+    from dataset.chon_ve_tinh_phu_vn import DIEM_VN, _doc_tle_theo_ten, tinh_goc_nang
+    from skyfield.api import load
+
+    tep = ROOT / "data" / "tle" / "starlink_vn150.txt"
+    if not tep.exists():
+        raise BoQua(
+            "chưa có data/tle/starlink_vn150.txt — chạy:\n"
+            "  python dataset/chon_ve_tinh_phu_vn.py --so-ve-tinh 150")
+
+    bo = _doc_tle_theo_ten(tep)
+    assert len(bo) == 150, f"tệp phải có 150 vệ tinh, đang {len(bo)}"
+
+    # Tên phải là Starlink THẬT, không lẫn SYN- của chòm Walker (v4).
+    assert all(t.startswith("STARLINK") for t in bo), \
+        f"có tên không phải Starlink: {[t for t in bo if not t.startswith('STARLINK')][:5]}"
+
+    # Phải là tập CON của tệp TLE gốc, và 2 dòng TLE trùng TỪNG KÝ TỰ (chép
+    # nguyên văn — dựng lại từ Satrec sẽ sai checksum).
+    goc = _doc_tle_theo_ten(ROOT / "data" / "tle" / "starlink.txt")
+    for ten, d1, d2 in bo.values():
+        assert ten in goc, f"{ten} không có trong data/tle/starlink.txt"
+        assert (d1, d2) == (goc[ten][1], goc[ten][2]), \
+            f"{ten}: hai dòng TLE bị sửa so với tệp gốc — sẽ hỏng checksum"
+
+    # Checksum: (tổng chữ số + số dấu '-') mod 10 trên 68 ký tự đầu.
+    for ten, d1, d2 in bo.values():
+        for d in (d1, d2):
+            assert len(d) == 69, f"{ten}: dòng TLE dài {len(d)}, phải 69"
+            tong = sum(int(c) for c in d[:68] if c.isdigit()) + d[:68].count("-")
+            assert d[68] == str(tong % 10), f"{ten}: sai checksum ở '{d[:20]}...'"
+
+    # Độ phủ: mọi vệ tinh phải nối được xuống VN ít nhất vài % thời gian, và
+    # tập phải phủ gần như mọi snapshot.
+    sats = load.tle_file(str(tep))
+    assert len(sats) == 150, f"skyfield đọc được {len(sats)}/150 vệ tinh"
+    ts = load.timescale()
+    # Mốc PHẢI là median epoch của CHÍNH 150 vệ tinh này — đúng như
+    # `resolve_start_time(ts, "tle", sample_sats)` ở `oracle_labeler_sagsin.py`
+    # dòng 200. Đo ở mốc khác (median toàn tệp 10 728 epoch) thì con số không
+    # liên quan gì tới dataset thật: cùng một tập cho 9.50 cặp/snapshot ở mốc
+    # toàn tệp nhưng chỉ 0.69 ở mốc labeler, vì hai mốc lệch ~5 giờ.
+    t0 = ts.tt_jd(float(np.median([s.epoch.tt for s in sats])))
+    mocs = ts.tt_jd(t0.tt + np.arange(600) * 20 / 86400.0)
+    noi_duoc = tinh_goc_nang(sats, mocs) >= 15.0
+
+    moi_snap = noi_duoc.sum(1)
+    ti_le_co = (moi_snap >= 1).mean()
+    assert ti_le_co >= 0.95, (
+        f"chỉ {ti_le_co * 100:.1f} % snapshot có ít nhất 1 vệ tinh nối được — "
+        f"tập này không phủ Việt Nam (ngưỡng 95 %)")
+    assert moi_snap.mean() >= 6.0, (
+        f"trung bình {moi_snap.mean():.2f} vệ tinh nối được/snapshot, kỳ vọng ≥6 "
+        f"(đo được 6.55 với nhóm epoch 585 vệ tinh)")
+
+    # Mốc labeler phải TÍNH TRƯỚC ĐƯỢC: mọi epoch trong tập phải trùng nhau đến
+    # giây để median không phụ thuộc vào việc chọn con nào. Không có tính chất
+    # này thì script chọn và labeler chạy ở hai mốc khác nhau (đúng lỗi đã sập).
+    giay = np.round(np.array([s.epoch.tt for s in sats]) * 86400).astype(np.int64)
+    assert len(np.unique(giay)) == 1, (
+        f"tập có {len(np.unique(giay))} epoch khác nhau — median (và do đó mốc "
+        f"labeler) sẽ phụ thuộc kết quả chọn, không tái lập được")
+
+    print(f"    150 vệ tinh thật, cùng 1 epoch | {moi_snap.mean():.2f} nối được/snapshot"
+          f" | {ti_le_co * 100:.1f} % snapshot có ≥1 | "
+          f"{(moi_snap >= 5).mean() * 100:.1f} % có ≥5 | "
+          f"mỗi vệ tinh phủ TB {noi_duoc.mean(0).mean() * 100:.1f} % thời gian")
+
+
+def test_uav_ven_bien_bac_phu_duoc_hai_phong_va_quang_ninh():
+    """UAV đặt cố định phải thật sự nối được, không chỉ 'gần'.
+
+    Bẫy đã sập một lần: đặt UAV-QuangYen cách Quảng Ninh 24.1 km (< 25 km) nhưng
+    góc nâng chỉ 4.65° < ngưỡng 5° của luật UAV_GROUND, nên cạnh KHÔNG được tạo
+    và nút Quảng Ninh cô lập suốt 600/600 snapshot mà không báo lỗi.
+    Test này khoá cả hai điều kiện: khoảng cách và góc nâng.
+    """
+    from src.physics.air_ground import (
+        _UAV_GROUND,
+        Node,
+        blocked_by_earth,
+        elevation_deg,
+        node_ecef_km,
+    )
+    uav = make_placed_uavs()
+    for nut_ten, la, lo, kind in [("HaiPhong", 20.8449, 106.6881, "gateway"),
+                                  ("QuangNinh", 20.9500, 107.0800, "user")]:
+        nut = Node(nut_ten, "ground", kind, la, lo, 0.0,
+                   can_relay=(kind == "gateway"), endpoint=True)
+        # chọn UAV gần nhất
+        gan = min(uav, key=lambda u: (node_ecef_km(u.node_at(0.0))
+                                      - node_ecef_km(nut)).dot(
+                                          node_ecef_km(u.node_at(0.0)) - node_ecef_km(nut)))
+        un = gan.node_at(0.0)
+        e_n, e_u = node_ecef_km(nut), node_ecef_km(un)
+        dist = float(np.linalg.norm(e_u - e_n))
+        elev = elevation_deg(nut, e_u)
+        assert dist <= _UAV_GROUND.max_range_km, \
+            f"{nut_ten}: UAV gần nhất ({gan.name}) cách {dist:.1f} km > {_UAV_GROUND.max_range_km} km"
+        assert elev >= _UAV_GROUND.min_elev_deg, \
+            f"{nut_ten}: góc nâng {elev:.2f}° < {_UAV_GROUND.min_elev_deg}° (cạnh sẽ không được tạo)"
+        assert not blocked_by_earth(e_u, e_n), f"{nut_ten}: bị Trái Đất chắn"
+
+
+def test_tep_thoi_tiet_mo_rong_khop_tep_23_diem():
+    """Tệp thời tiết mở rộng phải chứa ĐÚNG dữ liệu của tệp 23 điểm.
+
+    Bẫy đã sập một lần: sinh lại `thoi_tiet_vn_mr.npz` bằng lệnh `tai --mo-rong`
+    mà QUÊN chạy `them-giong`. Hậu quả không báo lỗi:
+      - mất hẳn `cape` / `lifted_index` / `code_fc`  -> không khí quyển nào có giông;
+      - cột `code` chỉ còn mã ERA5, số giờ giông về 0 (tệp đúng có 8 343 ô-giờ);
+      - UAV không bao giờ hạ cánh vì giông, sét không bao giờ ngắt nút mặt đất;
+      - mọi số liệu trên mạng mở rộng thành KHÔNG SO SÁNH ĐƯỢC với kết quả cũ.
+
+    Test so theo TÊN điểm (không theo chỉ số cột), vì 3 trạm ven biển mới được
+    chèn vào giữa danh sách chứ không nối vào cuối.
+    """
+    import numpy as np
+    from src.ngau_nhien.thoi_tiet import GIONG
+
+    mr = ROOT / "data" / "thoi_tiet_vn_mr.npz"
+    goc = ROOT / "data" / "thoi_tiet_vn.npz"
+    if not mr.exists() or not goc.exists():
+        raise BoQua("thiếu tệp thời tiết, bỏ qua")
+    a = np.load(goc, allow_pickle=False)
+    b = np.load(mr, allow_pickle=False)
+    ten_a = [str(x) for x in a["site_names"]]
+    ten_b = [str(x) for x in b["site_names"]]
+    thieu = [n for n in ten_a if n not in ten_b]
+    assert not thieu, f"tệp mở rộng thiếu điểm: {thieu}"
+    idx = [ten_b.index(n) for n in ten_a]
+
+    assert np.array_equal(a["time_utc"], b["time_utc"]), "trục thời gian phải khớp tuyệt đối"
+
+    # 1) Bắt buộc có đủ bộ biến khí quyển mà nhánh ERA5 không có (do them-giong sinh).
+    #    `code_fc` không có trong tệp 23 điểm cũ nên chỉ kiểm khi tệp gốc có.
+    for k in ("cape", "lifted_index"):
+        assert k in b.keys(), \
+            f"tệp mở rộng THIẾU '{k}': quên chạy `them-giong --vao data/thoi_tiet_vn_mr.npz`"
+
+    # 2) 23 cột cũ phải giống TỪNG BIT (kể cả mã thời tiết) => hồi quy cũ vẫn đúng.
+    for k in ("cape", "code", "code_fc", "lifted_index", "precip", "gust"):
+        if k not in a.keys():
+            continue
+        assert np.array_equal(a[k], b[k][:, idx], equal_nan=True), \
+            f"cột '{k}' của 23 điểm cũ đã bị thay đổi so với tệp gốc"
+
+    # 3) Phải THẬT SỰ có giông, không chỉ có cột rỗng.
+    so_giong = int(np.isin(b["code"][:, idx], GIONG).sum())
+    assert so_giong > 0, \
+        "số ô-giờ giông trong 23 điểm = 0: 'code' chưa được đặt lại theo luật CAPE"
+
+
+def test_tep_thoi_tiet_mo_rong_phu_dung_moi_nut():
+    """Tệp thời tiết phải có ĐÚNG các điểm mà mạng cần — không thiếu, không thừa.
+
+    Bẫy đã sập một lần: `thoi_tiet_vn_mr.npz` có 44 điểm (còn `UAV-VinhBacBo` đã
+    xoá, thiếu 8 UAV mới) trong khi cấu hình cần 51. Hệ quả KHÔNG báo lỗi:
+    `MangGoc` gán `node_site = -1`, rồi `kich_ban.sinh_kich_ban()` `continue` qua
+    nút đó, nên 8 UAV — trong đó có `UAV-BachLongVi` (đảo giật 58.7 m/s trong
+    Yagi, lý do chính để thêm nó) — KHÔNG BAO GIỜ hạ cánh vì giông hay gió, và
+    `tao_du_lieu` để đặc trưng thời tiết của chúng bằng 0.
+
+    Test cũ chỉ so 23 cột cũ nên không bắt được. Test này đòi khớp ĐÚNG tập điểm.
+    """
+    from src.ngau_nhien.thoi_tiet import cac_diem
+
+    mr = ROOT / "data" / "thoi_tiet_vn_mr.npz"
+    if not mr.exists():
+        raise BoQua("thiếu data/thoi_tiet_vn_mr.npz, bỏ qua")
+    with np.load(mr, allow_pickle=False) as d:
+        co = [str(x) for x in d["site_names"]]
+    can = [n for n, _, _ in cac_diem(mo_rong=True)]
+    thieu = [n for n in can if n not in set(co)]
+    thua = [n for n in co if n not in set(can)]
+    assert not thieu, (
+        f"tệp thời tiết thiếu {len(thieu)} điểm mà mạng cần: {thieu}. "
+        f"Các nút này sẽ có node_site = -1 (không mưa, không gió, UAV không hạ cánh). "
+        f"Chạy lại 'thoi_tiet tai --mo-rong' rồi 'them-giong'.")
+    assert not thua, (
+        f"tệp thời tiết có {len(thua)} điểm không còn trong cấu hình: {thua}. "
+        f"Cột chết này che lỗi thiếu điểm nếu chỉ kiểm một chiều.")
+    # 51 điểm của bản trước (23 cũ + 15 ground + 2 HAPS + 11 UAV) + 18 UAV ven biển
+    # Bắc Bộ/Bắc Trung Bộ + 1 nút ThanhHoa = 70. Nay + 4 nút chủ để cụm UAV Quảng
+    # Ninh/Nam Định đặt ĐÚNG địa danh mà vẫn nối được mặt đất (VanDon, HaiHa,
+    # GiaoThuy, HaiHau) = 74. Con số này cố ý viết cứng: nó là bất biến giữa
+    # `sites.py` và tệp dữ liệu, sửa một chỗ mà quên chỗ kia là lỗi thật.
+    assert len(can) == 74, f"cấu hình mở rộng phải có 74 điểm, đang {len(can)}"
+
+
+def test_uav_ven_bien_bac_trung_bo_phu_khep_vet_bao():
+    """18 UAV mới phải nằm trong tầm phủ THẬT của một nút mặt đất, và chia đúng nút chủ.
+
+    Vì sao: mục tiêu của cụm này là để dữ liệu huấn luyện có `tat`/`ha_canh` ngay
+    trên vệt bão Yagi. Một UAV không phủ nút nào thì khi hạ cánh KHÔNG làm đổi
+    đường đi của bất kỳ nút nào — đúng bẫy `UAV-VinhBacBo` (cách Thái Bình 51 km,
+    xa hơn tầm UAV_GROUND ~22.4 km). Test khoá ba bất biến:
+      1) cách nút chủ ≤ `_UAV_GROUND.max_range_km` và góc nâng ≥ ngưỡng;
+      2) nếu cách ≤ 1 km thì phải TRÙNG toạ độ nút chủ (cùng chỗ ⇒ cùng cột thời
+         tiết); lệch vài trăm mét là hai cột mưa/gió khác nhau;
+      3) không có UAV nào trong cụm bị "mồ côi" (không nút chủ).
+    """
+    from src.physics.air_ground import _UAV_GROUND, elevation_deg, node_ecef_km
+
+    MOI = ["UAV-HonGai", "UAV-BaiChay", "UAV-VanDon", "UAV-HaiHa", "UAV-UongBi",
+           "UAV-SaVi", "UAV-DoSon", "UAV-ThuongLy", "UAV-CatBa", "UAV-CatHai",
+           "UAV-TienLang", "UAV-KienAn", "UAV-ThaiThuy", "UAV-TienHai",
+           "UAV-GiaoThuy", "UAV-HaiHau", "UAV-SamSon", "UAV-Vinh"]
+    ten = {u.name for u in make_placed_uavs()}
+    assert set(MOI) <= ten, f"thiếu UAV trong cấu hình: {set(MOI) - ten}"
+
+    st = static_nodes(mo_rong=True)
+    mat_dat = [n for n in st if n.layer == "ground"]
+    hinh_hoc = {n.name: node_ecef_km(n) for n in mat_dat}
+    toa_do = {n.name: (n.lat_deg, n.lon_deg) for n in mat_dat}
+    for u in make_placed_uavs():
+        if u.name not in MOI:
+            continue
+        e_u = node_ecef_km(u.node_at(0.0))
+        phu = [(float(np.linalg.norm(e - e_u)), n) for n, e in hinh_hoc.items()
+               if float(np.linalg.norm(e - e_u)) <= _UAV_GROUND.max_range_km
+               and elevation_deg(next(g for g in mat_dat if g.name == n), e_u)
+               >= (_UAV_GROUND.min_elev_deg or 0.0)]
+        assert phu, (f"{u.name} ({u.center_lat_deg}, {u.center_lon_deg}) không phục vụ nút mặt đất nào "
+                     f"-> hạ cánh mà không đổi đường đi của nút nào")
+        d, n = min(phu)
+        if d <= 1.0:
+            la, lo = toa_do[n]
+            assert abs(u.center_lat_deg - la) < 1e-6 and abs(u.center_lon_deg - lo) < 1e-6, \
+                (f"{u.name} cách {n} {d:.2f} km nhưng KHÔNG trùng toạ độ: UAV "
+                 f"({u.center_lat_deg}, {u.center_lon_deg}) vs nút ({la}, {lo}) — "
+                 f"hai cột thời tiết khác nhau cho cùng một chỗ")
+
+
+def test_tep_thoi_tiet_co_giong_that_tren_vet_bao_yagi():
+    """Cột thời tiết của các điểm ven biển Bắc Bộ phải có giông/gió mạnh THẬT trong Yagi.
+
+    Bẫy đã sập: nối cột mới vào tệp mà quên `them-giong` thì `code` chỉ còn mã ERA5,
+    số giờ giông bằng 0, và UAV mới KHÔNG BAO GIỜ hạ cánh vì giông — dữ liệu trông
+    hợp lệ nhưng không có tình huống bão nào để học.
+    """
+    from src.ngau_nhien.thoi_tiet import GIONG
+
+    mr = ROOT / "data" / "thoi_tiet_vn_mr.npz"
+    if not mr.exists():
+        raise BoQua("thiếu data/thoi_tiet_vn_mr.npz, bỏ qua")
+    with np.load(mr, allow_pickle=False) as d:
+        ten = [str(x) for x in d["site_names"]]
+        t = np.array([str(x) for x in d["time_utc"]])
+        yagi = (t >= "2024-09-07") & (t < "2024-09-09")
+        for n in ("HaiPhong", "QuangNinh", "BachLongVi", "UAV-DoSon", "UAV-CatBa"):
+            assert n in ten, f"tệp thời tiết thiếu cột {n}"
+            i = ten.index(n)
+            assert np.isin(d["code"][yagi, i], GIONG).any(), \
+                f"{n}: 0 giờ giông trong Yagi — cột mới chưa qua luật CAPE (chạy them-giong)"
+            assert d["gust"][yagi, i].max() >= 15.0, \
+                f"{n}: gió giật cực đại {d['gust'][yagi, i].max():.1f} m/s < 15 — không đủ để hạ cánh"
+
+
+def test_uav_dat_co_dinh_khop_thoi_tiet_voi_nut_chu():
+    """UAV đặt đúng toạ độ một nút thì cột thời tiết phải TRÙNG KHÍT nút đó.
+
+    Đây là bất biến vật lý: cùng một chỗ thì cùng mưa, cùng gió, cùng giông.
+    Nếu lệch, tức là toạ độ hai bên đã trôi khỏi nhau (sửa một chỗ quên chỗ kia)
+    — và bản đồ/báo cáo sẽ nói UAV ở nơi nó không ở.
+    """
+    from src.ngau_nhien.thoi_tiet import cac_diem
+
+    mr = ROOT / "data" / "thoi_tiet_vn_mr.npz"
+    if not mr.exists():
+        raise BoQua("thiếu data/thoi_tiet_vn_mr.npz, bỏ qua")
+    toa_do = {n: (la, lo) for n, la, lo in cac_diem(mo_rong=True)}
+    cap_uav = [(u, h) for u, h in (
+        ("UAV-BachLongVi", "BachLongVi"), ("UAV-LySon", "LySon"),
+        ("UAV-BuonMaThuot", "BuonMaThuot"), ("UAV-DaLat", "DaLat"),
+        ("UAV-CaMau", "CaMau"), ("UAV-ConDao", "ConDao"),
+        ("UAV-PhuQuoc", "PhuQuoc"), ("UAV-SaPa", "SaPa"),
+        ("UAV-HoangSa", "HoangSa"), ("UAV-TruongSa", "TruongSa"),
+        ("UAV-HaiPhong", "HaiPhong")) if u in toa_do and h in toa_do]
+
+    with np.load(mr, allow_pickle=False) as d:
+        ten = [str(x) for x in d["site_names"]]
+        bien = [k for k in ("precip", "code", "gust", "cape", "code_fc") if k in d.keys()]
+        for u, h in cap_uav:
+            (la_u, lo_u), (la_h, lo_h) = toa_do[u], toa_do[h]
+            assert abs(la_u - la_h) < 1e-4 and abs(lo_u - lo_h) < 1e-4, \
+                f"{u} ({la_u}/{lo_u}) không còn trùng toạ độ {h} ({la_h}/{lo_h})"
+            iu, ih = ten.index(u), ten.index(h)
+            for k in bien:
+                assert np.array_equal(d[k][:, iu], d[k][:, ih], equal_nan=True), \
+                    f"cột '{k}' của {u} khác {h} dù cùng toạ độ"
+
+
+def test_uav_dat_co_dinh_phu_duoc_it_nhat_mot_nut_mat_dat():
+    """Mỗi UAV đặt cố định phải phục vụ được ít nhất một nút mặt đất.
+
+    Bẫy đã sập một lần: `UAV-VinhBacBo` đặt ở 20.30/106.80 "giữa vịnh Bắc Bộ".
+    Nút gần nhất (Thái Bình) cách 51 km, xa hơn tầm với thật của luật UAV_GROUND
+    (~22.4 km như phân tích trong air_ground.UAV_DAT_ALT_M), nên UAV này chỉ nối
+    được HAPS và vệ tinh — nó hạ cánh khi có gió nhưng KHÔNG ảnh hưởng đường đi
+    của bất kỳ nút nào. Đã dời về đúng Bạch Long Vĩ.
+    """
+    from src.physics.air_ground import _UAV_GROUND, elevation_deg, node_ecef_km
+
+    st = static_nodes(mo_rong=True)
+    mat_dat = [n for n in st if n.layer == "ground"]
+    for u in make_placed_uavs():
+        un = u.node_at(0.0)
+        e_u = node_ecef_km(un)
+        phu = [g.name for g in mat_dat
+               if float(np.linalg.norm(node_ecef_km(g) - e_u)) <= _UAV_GROUND.max_range_km
+               and elevation_deg(g, e_u) >= (_UAV_GROUND.min_elev_deg or 0.0)]
+        assert phu, (f"{u.name} ({u.center_lat_deg}, {u.center_lon_deg}) không phục vụ "
+                     f"nút mặt đất nào — chỉ nối được HAPS/vệ tinh")
+
+
+def test_bach_long_vi_co_ha_tang_cuu_nut():
+    """Bạch Long Vĩ là nơi giật mạnh nhất trong bão Yagi và từng cô lập 100%.
+
+    Nút này phải có ít nhất một liên kết cục bộ (UAV/HAPS), không chỉ vệ tinh.
+    """
+    from src.physics.air_ground import compute_local_links
+
+    st = static_nodes(mo_rong=True)
+    links = compute_local_links(st + [p.node_at(0.0) for p in make_placed_uavs()])
+    co = [l for l in links if l["exists"] and "BachLongVi" in (l["node_a"], l["node_b"])]
+    assert co, "BachLongVi không có liên kết cục bộ nào (chỉ còn đường vệ tinh)"
+    print("    BachLongVi nối cục bộ với: "
+          + ", ".join(sorted({l["node_b"] if l["node_a"] == "BachLongVi" else l["node_a"]
+                              for l in co})))
+
+
+def test_v3_do_cao_ve_tinh_hop_le():
+    """`node_latlon_alt` của vệ tinh phải là ĐỘ CAO QUỸ ĐẠO, không phải 0.
+
+    Bẫy đã sập một lần: code ghi `wgs84.subpoint_of(...).elevation.km`, luôn = 0.
+    Đó là độ cao ellipsoid tại điểm chiếu dưới chân vệ tinh, KHÔNG phải độ cao
+    quỹ đạo, nên cả 50 vệ tinh đều có alt = 0.0 mà không báo lỗi — trong khi
+    Starlink thật bay ở ~550 km. Bẫy thứ hai: TLE chứa cả vệ tinh đã rơi; chúng
+    cho độ cao ÂM (vd -2855 km) hoặc NaN, làm hỏng mọi tính hình học.
+    """
+    if not V3.exists():
+        raise BoQua("chưa có oracle_dataset_v3.npz")
+    b = np.load(V3, allow_pickle=True)
+    lop = [str(x) for x in b["node_layer"]]
+    alt = b["node_latlon_alt"]
+    i_sat = [i for i, l in enumerate(lop) if l == "space"]
+    assert i_sat, "v3 không có vệ tinh nào"
+    a = alt[:, i_sat, 2].ravel()
+    assert np.isfinite(a).all(), f"có {int((~np.isfinite(a)).sum())} độ cao vệ tinh NaN"
+    assert (a > 0).all(), f"có {int((a <= 0).sum())} độ cao vệ tinh <= 0 (min {a.min():.1f} km)"
+    # Starlink: quỹ đạo thấp ~300-600 km. Cho biên rộng nhưng phải loại được cả 0
+    # và các giá trị vô nghĩa, đồng thời bắt được nếu ai đó lại ghi subpoint.
+    assert 100.0 < float(np.median(a)) < 2000.0, \
+        f"trung vị độ cao vệ tinh {np.median(a):.1f} km không giống quỹ đạo thật"
+
+    # Nút mặt đất: độ cao nhỏ (km, tức vài trăm mét)
+    i_gnd = [i for i, l in enumerate(lop) if l == "ground"]
+    if i_gnd:
+        g = alt[:, i_gnd, 2]
+        assert np.isfinite(g).all()
+        assert (np.abs(g) < 10.0).all(), "độ cao nút mặt đất bất thường"
+
+
+def _run():
+    return chay_tests(globals(), "test_mang_mo_rong")
+
+
+
+
+def test_mang_goc_chan_tep_thoi_tiet_lech():
+    """`MangGoc` phải tự chặn tệp thời tiết lệch — kể cả khi nơi gọi QUÊN bật kiểm.
+
+    Đây là chốt chặn chính vì `MangGoc` mới là nơi gán `node_site = -1`. Trước
+    đây việc kiểm nằm rải ở từng script (`tao_du_lieu.main` bật, còn
+    `khoang_loi`, `luat_chia_doi`, `phan_tich_nhieu_mua`, `huong_dan/buoc_7`,
+    `buoc_8` thì không) ⇒ đường chạy nào quên bật là lỗi âm thầm quay lại.
+
+    Test dựng bản tệp lỗi riêng (bỏ 8 UAV mới) thay vì dùng tệp thật, để không
+    ghi đè `data/thoi_tiet_vn_mr.npz`.
+    """
+    import tempfile
+    from src.ngau_nhien.kich_ban import MangGoc
+    from src.ngau_nhien.thoi_tiet import ThoiTiet
+
+    mr = ROOT / "data" / "thoi_tiet_vn_mr.npz"
+    if not mr.exists():
+        raise BoQua("thiếu data/thoi_tiet_vn_mr.npz, bỏ qua")
+    d = dict(np.load(mr, allow_pickle=False))
+    ten = [str(x) for x in d["site_names"]]
+    bo = {"UAV-BachLongVi", "UAV-LySon", "UAV-BuonMaThuot", "UAV-DaLat",
+          "UAV-CaMau", "UAV-ConDao", "UAV-PhuQuoc", "UAV-SaPa"}
+    giu = [k for k, n in enumerate(ten) if n not in bo]
+    assert len(giu) == len(ten) - 8, f"tệp đã khác giả định: {len(ten)} điểm"
+    # `lat`/`lon` là vectơ 1-D theo ĐIỂM, các trường còn lại là 2-D (giờ × điểm).
+    # Cắt chung bằng `v[..., giu]` sẽ lấy chỉ số giờ cho vectơ 1-D và văng
+    # IndexError khi số điểm > số giờ... ở đây là > 70 cột: đúng cái bẫy gặp khi
+    # cấu hình mở rộng vượt 70 điểm (74 sau khi thêm 4 nút chủ).
+    loi = {k: (v[:, giu] if v.ndim == 2 else v[giu])
+           for k, v in d.items() if k in ("lat", "lon", "precip", "code", "gust",
+                                          "code_fc", "cape", "lifted_index", "code_era5")}
+    loi.update(time_utc=d["time_utc"], nguon=d["nguon"],
+               site_names=np.array([ten[k] for k in giu]))
+
+    voi = tempfile.TemporaryDirectory()
+    p = Path(voi.name) / "lech.npz"
+    np.savez(p, **loi)
+    try:
+        # kiem_tra=False ở ThoiTiet: mô phỏng đúng cảnh nơi gọi KHÔNG bật kiểm.
+        tt = ThoiTiet(str(p), kiem_tra=False)
+        try:
+            MangGoc(np.ones((1, 101, 101)) * 2.0, ["user"] * 101,
+                    [f"n{k}" for k in range(101)], tt)
+        except ValueError as e:
+            assert "UAV-BachLongVi" in str(e), f"lỗi không nêu tên điểm thiếu: {e}"
+        else:
+            raise AssertionError(
+                "MangGoc nhận tệp thiếu 8 điểm mà không báo lỗi: node_site sẽ = -1 "
+                "và 8 UAV lặng lẽ không bao giờ hạ cánh.")
+    finally:
+        voi.cleanup()
+
+    # Tệp đúng thì phải dựng được mạng (chốt chặn không được chặn nhầm).
+    tt_ok = ThoiTiet(str(mr))
+    MangGoc(np.ones((1, 101, 101)) * 2.0, ["user"] * 101,
+            [f"n{k}" for k in range(101)], tt_ok)
+
+if __name__ == "__main__":
+    sys.exit(0 if _run() else 1)
